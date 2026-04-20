@@ -183,10 +183,10 @@ namespace mujoco_rgbd_camera {
         z_far_ = mujoco_model_->vis.map.zfar;
 
         cv::Size img_size(viewport.width, viewport.height);
-        cv::Mat bgr(img_size, CV_8UC3, color_buffer_);
-        cv::flip(bgr, bgr, -1);
-        cv::Mat rgb;
-        cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+        // mjr_readPixels returns GL_RGB, so the buffer is already RGB.
+        // No BGR<->RGB swap needed; advertise encoding "rgb8" downstream.
+        cv::Mat rgb(img_size, CV_8UC3, color_buffer_);
+        cv::flip(rgb, rgb, -1);
         rgb.copyTo(color_image_);
 
 
@@ -269,7 +269,11 @@ namespace mujoco_rgbd_camera {
 
         if (params_.color_image) {
             cv_ptr->image = color_image_;
-            cv_ptr->encoding = "8UC3";
+            // "rgb8" so cv_bridge consumers (cv_bridge.imgmsg_to_cv2 with
+            // "bgr8", image_transport, etc.) know the channel order. The
+            // previous "8UC3" is a color-agnostic label and breaks the
+            // standard color conversions downstream.
+            cv_ptr->encoding = "rgb8";
             cv_ptr->toImageMsg(out_image);
             out_image.header.stamp = stamp_;
             out_image.header.frame_id = body_name_;
