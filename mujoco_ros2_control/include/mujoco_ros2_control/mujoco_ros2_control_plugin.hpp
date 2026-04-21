@@ -87,6 +87,7 @@
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "geometry_msgs/msg/pose.hpp"
 #include "rosgraph_msgs/msg/clock.hpp"
+#include "moveit_msgs/msg/attached_collision_object.hpp"
 
 // URDF
 #include "urdf/urdf/model.h"
@@ -273,6 +274,20 @@ namespace mujoco_ros2_control
         std::vector<std::shared_ptr<mujoco_rgbd_camera::MujocoDepthCamera>> cameras_; ///< Cameras Object vector
 
         std::shared_ptr<mujoco_ros2_sensors::MujocoRos2Sensors> mujoco_ros2_sensors_;
+
+        // Weld-on-attach: subscribes to /attached_collision_object (what
+        // MoveIt publishes when pick_server attaches the pick object to
+        // link_eef) and toggles a named MuJoCo weld equality so the object
+        // is physically pinned to the gripper instead of depending on
+        // fragile contact friction.  Detach publishes REMOVE and we turn
+        // the weld off again.  The activation is deferred via a timer so
+        // the gripper finishes physically closing on the object first;
+        // otherwise the weld freezes the cube at whatever offset it had
+        // at attach time (before close_gripper), and it hangs skewed on
+        // the gripper through the retreat.
+        rclcpp::Subscription<moveit_msgs::msg::AttachedCollisionObject>::SharedPtr attach_sub_;
+        rclcpp::TimerBase::SharedPtr weld_activation_timer_;
+        int pending_weld_eq_id_{-1};
     };
 }  // namespace mujoco_ros2_control
 

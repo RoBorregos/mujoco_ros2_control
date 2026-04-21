@@ -104,6 +104,68 @@ MujocoRos2Control::MujocoRos2Control(rclcpp::Node::SharedPtr &node) : nh_(node) 
 
   thread_sim_ = std::thread(&MujocoRos2Control::update, this);
   RCLCPP_INFO(nh_->get_logger(), "Sim environment setup complete");
+
+  // Weld-on-attach listener.  pick_server (via pymoveit2) publishes an
+  // AttachedCollisionObject on /attached_collision_object every time it
+  // attaches or detaches the pick object on link_eef.  We look for any
+  // MuJoCo equality whose name matches the attached object id and toggle
+  // eq_active accordingly; the mujoco XML declares e.g.
+  //   <weld name="cube_to_eef" body1="cube_link" body2="link_eef" active="false"/>
+  // and the xacro adds one per pickable object.  Fallback: if no matching
+  // equality name is found we try a hard-coded "cube_to_eef" so the single
+  // sim-cube scene works out of the box.
+  attach_sub_ = nh_->create_subscription<moveit_msgs::msg::AttachedCollisionObject>(
+      "/attached_collision_object", rclcpp::QoS(10),
+      [this](const moveit_msgs::msg::AttachedCollisionObject::SharedPtr msg) {
+        if (mujoco_model_ == nullptr || mujoco_data_ == nullptr) return;
+        const std::string &obj_id = msg->object.id;
+        const int op = msg->object.operation;
+        // moveit_msgs::CollisionObject operation: ADD=0, REMOVE=1.
+        const bool activate = (op == moveit_msgs::msg::CollisionObject::ADD);
+        int eq_id = mj_name2id(mujoco_model_, mjOBJ_EQUALITY, obj_id.c_str());
+        if (eq_id < 0) {
+          // Fallback to canonical name for single-object scenes.
+          eq_id = mj_name2id(mujoco_model_, mjOBJ_EQUALITY, "cube_to_eef");
+        }
+        if (eq_id < 0) {
+          RCLCPP_DEBUG(nh_->get_logger(),
+                       "No matching weld equality for attached object '%s'", obj_id.c_str());
+          return;
+        }
+        if (activate) {
+          // Defer activation ~1.5 s so close_gripper has time to settle the
+          // fingers against the object.  If we activate immediately the
+          // weld freezes cube<->eef at whatever relative pose they have
+          // when pick_server publishes the attach -- which is RIGHT after
+          // "Grasp pose reached" but before "Closing gripper" -- and the
+          // cube ends up hanging skewed off one finger through the
+          // retreat.
+          pending_weld_eq_id_ = eq_id;
+          if (weld_activation_timer_) weld_activation_timer_->cancel();
+          weld_activation_timer_ = nh_->create_wall_timer(
+              std::chrono::milliseconds(1500),
+              [this, obj_id]() {
+                if (pending_weld_eq_id_ >= 0 && mujoco_data_ != nullptr) {
+                  mujoco_data_->eq_active[pending_weld_eq_id_] = 1;
+                  RCLCPP_INFO(nh_->get_logger(),
+                              "Weld equality %d for object '%s' -> active=1 (deferred)",
+                              pending_weld_eq_id_, obj_id.c_str());
+                  pending_weld_eq_id_ = -1;
+                }
+                if (weld_activation_timer_) weld_activation_timer_->cancel();
+              });
+          RCLCPP_INFO(nh_->get_logger(),
+                      "Scheduled weld activation for '%s' in 1.5 s", obj_id.c_str());
+        } else {
+          // Detach is immediate.
+          if (weld_activation_timer_) weld_activation_timer_->cancel();
+          pending_weld_eq_id_ = -1;
+          mujoco_data_->eq_active[eq_id] = 0;
+          RCLCPP_INFO(nh_->get_logger(),
+                      "Weld equality %d for object '%s' -> active=0",
+                      eq_id, obj_id.c_str());
+        }
+      });
 }
 
 MujocoRos2Control::~MujocoRos2Control()
