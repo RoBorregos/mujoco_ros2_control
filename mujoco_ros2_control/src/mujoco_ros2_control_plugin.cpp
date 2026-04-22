@@ -105,15 +105,17 @@ MujocoRos2Control::MujocoRos2Control(rclcpp::Node::SharedPtr &node) : nh_(node) 
   thread_sim_ = std::thread(&MujocoRos2Control::update, this);
   RCLCPP_INFO(nh_->get_logger(), "Sim environment setup complete");
 
-  // Weld-on-attach listener.  pick_server (via pymoveit2) publishes an
+  // Adhesion-on-attach listener.  pick_server (via pymoveit2) publishes an
   // AttachedCollisionObject on /attached_collision_object every time it
-  // attaches or detaches the pick object on link_eef.  We look for any
-  // MuJoCo equality whose name matches the attached object id and toggle
-  // eq_active accordingly; the mujoco XML declares e.g.
-  //   <weld name="cube_to_eef" body1="cube_link" body2="link_eef" active="false"/>
-  // and the xacro adds one per pickable object.  Fallback: if no matching
-  // equality name is found we try a hard-coded "cube_to_eef" so the single
-  // sim-cube scene works out of the box.
+  // attaches or detaches the pick object on link_eef.  On ADD, we raise
+  // the ctrl of all adhesion actuators to 1 (full pull); on REMOVE, we
+  // drop them to 0.  The adhesion actuators only apply force while the
+  // finger body is in contact with some other body, so arming them
+  // before the gripper closes is harmless -- they only start pulling
+  // the cube once the fingers actually touch it.  This mirrors the
+  // approach used by MetaWorld and other MuJoCo manipulation benchmarks.
+  // As a fallback we also toggle any equality named "cube_to_eef" (or
+  // matching the object id) so older scenes that rely on weld still work.
   attach_sub_ = nh_->create_subscription<moveit_msgs::msg::AttachedCollisionObject>(
       "/attached_collision_object", rclcpp::QoS(10),
       [this](const moveit_msgs::msg::AttachedCollisionObject::SharedPtr msg) {
@@ -122,48 +124,84 @@ MujocoRos2Control::MujocoRos2Control(rclcpp::Node::SharedPtr &node) : nh_(node) 
         const int op = msg->object.operation;
         // moveit_msgs::CollisionObject operation: ADD=0, REMOVE=1.
         const bool activate = (op == moveit_msgs::msg::CollisionObject::ADD);
+        const double ctrl_target = activate ? 1.0 : 0.0;
+
+        // Primary path: adhesion actuators.  Pull any actuator whose name
+        // matches the "*_adhesion" convention.
+        int touched_actuators = 0;
+        for (int act_id = 0; act_id < mujoco_model_->nu; ++act_id) {
+          const char *name = mj_id2name(mujoco_model_, mjOBJ_ACTUATOR, act_id);
+          if (name == nullptr) continue;
+          std::string sname(name);
+          if (sname.find("adhesion") == std::string::npos) continue;
+          mujoco_data_->ctrl[act_id] = ctrl_target;
+          ++touched_actuators;
+        }
+
+        // Fallback path: toggle a weld equality by object id or canonical
+        // name, in case a scene still wires up the old mechanism.
         int eq_id = mj_name2id(mujoco_model_, mjOBJ_EQUALITY, obj_id.c_str());
-        if (eq_id < 0) {
-          // Fallback to canonical name for single-object scenes.
-          eq_id = mj_name2id(mujoco_model_, mjOBJ_EQUALITY, "cube_to_eef");
+        if (eq_id < 0) eq_id = mj_name2id(mujoco_model_, mjOBJ_EQUALITY, "cube_to_eef");
+        if (eq_id >= 0) {
+          mujoco_data_->eq_active[eq_id] = activate ? 1 : 0;
         }
-        if (eq_id < 0) {
-          RCLCPP_DEBUG(nh_->get_logger(),
-                       "No matching weld equality for attached object '%s'", obj_id.c_str());
-          return;
-        }
-        if (activate) {
-          // Defer activation ~1.5 s so close_gripper has time to settle the
-          // fingers against the object.  If we activate immediately the
-          // weld freezes cube<->eef at whatever relative pose they have
-          // when pick_server publishes the attach -- which is RIGHT after
-          // "Grasp pose reached" but before "Closing gripper" -- and the
-          // cube ends up hanging skewed off one finger through the
-          // retreat.
-          pending_weld_eq_id_ = eq_id;
-          if (weld_activation_timer_) weld_activation_timer_->cancel();
-          weld_activation_timer_ = nh_->create_wall_timer(
-              std::chrono::milliseconds(1500),
-              [this, obj_id]() {
-                if (pending_weld_eq_id_ >= 0 && mujoco_data_ != nullptr) {
-                  mujoco_data_->eq_active[pending_weld_eq_id_] = 1;
-                  RCLCPP_INFO(nh_->get_logger(),
-                              "Weld equality %d for object '%s' -> active=1 (deferred)",
-                              pending_weld_eq_id_, obj_id.c_str());
-                  pending_weld_eq_id_ = -1;
-                }
-                if (weld_activation_timer_) weld_activation_timer_->cancel();
-              });
+
+        if (touched_actuators > 0 || eq_id >= 0) {
           RCLCPP_INFO(nh_->get_logger(),
-                      "Scheduled weld activation for '%s' in 1.5 s", obj_id.c_str());
+                      "Attach op=%s id='%s': set %d adhesion actuator(s) ctrl=%.1f%s",
+                      activate ? "ADD" : "REMOVE", obj_id.c_str(),
+                      touched_actuators, ctrl_target,
+                      eq_id >= 0 ? " and toggled weld equality" : "");
         } else {
-          // Detach is immediate.
-          if (weld_activation_timer_) weld_activation_timer_->cancel();
-          pending_weld_eq_id_ = -1;
-          mujoco_data_->eq_active[eq_id] = 0;
+          RCLCPP_DEBUG(nh_->get_logger(),
+                       "Attach op=%s id='%s': no adhesion actuators or weld found",
+                       activate ? "ADD" : "REMOVE", obj_id.c_str());
+        }
+      });
+
+  // Gripper trajectory listener: whenever a trajectory commanding the
+  // rightfinger arrives, set adhesion ctrl to match the commanded state
+  // (closed finger => adhesion on, open finger => adhesion off).  This is
+  // the ground-truth signal for "gripper is trying to grasp or release"
+  // and sidesteps the /attached_collision_object race where pick_server
+  // attaches before close_gripper and place_server opens the gripper
+  // without publishing a reliable detach -- which left the cube stuck in
+  // the gripper through the retreat and falling on home pose instead of
+  // at the place point.
+  gripper_traj_sub_ = nh_->create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      "/xarm_gripper_traj_controller/joint_trajectory", rclcpp::QoS(10),
+      [this](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+        if (mujoco_model_ == nullptr || mujoco_data_ == nullptr) return;
+        // Find the rightfinger position in the trajectory point; treat
+        // any position >= half the closed-range as "closing" (adhesion
+        // on) and below as "opening" (adhesion off).
+        if (msg->points.empty()) return;
+        const auto &joints = msg->joint_names;
+        const auto &positions = msg->points.back().positions;
+        double rightfinger_target = -1.0;
+        for (size_t i = 0; i < joints.size() && i < positions.size(); ++i) {
+          if (joints[i] == "rightfinger") {
+            rightfinger_target = positions[i];
+            break;
+          }
+        }
+        if (rightfinger_target < 0.0) return;
+        // rightfinger range is 0 (open) to 0.056 (closed); threshold at
+        // 0.02 gives clear separation for both command directions.
+        const double ctrl_target = (rightfinger_target > 0.02) ? 1.0 : 0.0;
+        int touched = 0;
+        for (int act_id = 0; act_id < mujoco_model_->nu; ++act_id) {
+          const char *name = mj_id2name(mujoco_model_, mjOBJ_ACTUATOR, act_id);
+          if (name == nullptr) continue;
+          if (std::string(name).find("adhesion") == std::string::npos) continue;
+          if (mujoco_data_->ctrl[act_id] == ctrl_target) continue;
+          mujoco_data_->ctrl[act_id] = ctrl_target;
+          ++touched;
+        }
+        if (touched > 0) {
           RCLCPP_INFO(nh_->get_logger(),
-                      "Weld equality %d for object '%s' -> active=0",
-                      eq_id, obj_id.c_str());
+                      "Gripper command rightfinger=%.3f: adhesion ctrl=%.1f on %d actuator(s)",
+                      rightfinger_target, ctrl_target, touched);
         }
       });
 }

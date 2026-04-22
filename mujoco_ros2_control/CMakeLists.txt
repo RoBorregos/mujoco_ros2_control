@@ -40,6 +40,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
     Eigen3
     tf2_ros
     moveit_msgs
+    trajectory_msgs
 )
 
 foreach(Dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
@@ -153,6 +154,7 @@ ament_target_dependencies(${PROJECT_NAME}
     pcl_conversions
     tf2_ros
     moveit_msgs
+    trajectory_msgs
 )
 
 # Link libraries to the main executable

@@ -266,7 +266,19 @@ namespace mujoco_ros2_control {
         
 
         for (int mujoco_actuator_id = 0; mujoco_actuator_id < mujoco_model_->nu; mujoco_actuator_id++) {
-            std::string joint_name = mj_id2name(mujoco_model_, mjOBJ_JOINT, mujoco_model_->actuator_trnid[mujoco_actuator_id*2]);
+            // Adhesion actuators (and any other non-joint transmission type)
+            // target bodies, not joints, so mj_id2name(JOINT, ...) returns
+            // null and constructing a std::string from it throws.  Skip any
+            // actuator whose transmission is not a joint.
+            const int trn_type = mujoco_model_->actuator_trntype[mujoco_actuator_id];
+            if (trn_type != mjTRN_JOINT && trn_type != mjTRN_JOINTINPARENT) {
+                continue;
+            }
+            const char *joint_cname = mj_id2name(mujoco_model_, mjOBJ_JOINT, mujoco_model_->actuator_trnid[mujoco_actuator_id*2]);
+            if (joint_cname == nullptr) {
+                continue;
+            }
+            std::string joint_name(joint_cname);
             if (joints_[joint_name].name.empty()) {
                 continue;
             }

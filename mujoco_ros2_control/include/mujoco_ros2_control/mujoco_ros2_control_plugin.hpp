@@ -88,6 +88,7 @@
 #include "geometry_msgs/msg/pose.hpp"
 #include "rosgraph_msgs/msg/clock.hpp"
 #include "moveit_msgs/msg/attached_collision_object.hpp"
+#include "trajectory_msgs/msg/joint_trajectory.hpp"
 
 // URDF
 #include "urdf/urdf/model.h"
@@ -286,6 +287,11 @@ namespace mujoco_ros2_control
         // at attach time (before close_gripper), and it hangs skewed on
         // the gripper through the retreat.
         rclcpp::Subscription<moveit_msgs::msg::AttachedCollisionObject>::SharedPtr attach_sub_;
+        // Gripper trajectory listener: syncs adhesion actuators with the
+        // finger close/open command so adhesion releases the object at the
+        // exact moment the gripper opens (which is the ground truth for
+        // "let go"), regardless of whether MoveIt publishes a detach.
+        rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr gripper_traj_sub_;
         rclcpp::TimerBase::SharedPtr weld_activation_timer_;
         int pending_weld_eq_id_{-1};
     };
